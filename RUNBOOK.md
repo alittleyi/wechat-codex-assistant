@@ -17,6 +17,6 @@
 
 ## 故障处理
 
-- 先运行 `scripts/preflight.ps1` 和调度桥 `health`，保存脱敏摘要。
+- 先运行 `scripts/preflight.ps1` 和调度桥 `health`，保存脱敏摘要。调度桥 `prepare`/`claim` 必须同时提供 ready、canonical-chat 和匹配的主会话引用；busy、写锁、网络失败、恢复失败、临时/协调会话或引用不匹配时返回 blocked，不创建新聊天或继续下游发布。
 - 不手工删除锁或篡改运行记录；使用租约超时与受控恢复。
 - 不把合成测试、浏览器演示或历史机器记录当成当前手机验收。

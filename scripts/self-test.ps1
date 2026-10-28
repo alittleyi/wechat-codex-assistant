@@ -34,9 +34,15 @@ try {
     $fixture = Join-Path $workspace 'media-fixtures\synthetic-financial-fixture.md'
     $privacy = (& (Join-Path $PSScriptRoot 'inspect-document.ps1') -Path $fixture) | ConvertFrom-Json
     $labels = @($privacy.sensitive_patterns_detected)
-    $expected = @('长交易识别号','微信号','中文姓名字段','财务凭证字段')
+    $expected = @(
+        '6ZW/5Lqk5piT6K+G5Yir5Y+3',
+        '5b6u5L+h5Y+3',
+        '5Lit5paH5aeT5ZCN5a2X5q61',
+        '6LSi5Yqh5Yet6K+B5a2X5q61'
+    ) | ForEach-Object { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($_)) }
     $allDetected = @($expected | Where-Object { $_ -notin $labels }).Count -eq 0
-    $hidden = [string]$privacy.preview_redacted -eq '检测到敏感字段，预览已整体隐藏；仅供本机授权处理。'
+    $hiddenText = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('5qOA5rWL5Yiw5pWP5oSf5a2X5q6177yM6aKE6KeI5bey5pW05L2T6ZqQ6JeP77yb5LuF5L6b5pys5py65o6I5p2D5aSE55CG44CC'))
+    $hidden = [string]$privacy.preview_redacted -eq $hiddenText
     Add-Result 'document-financial-redaction' ($allDetected -and $hidden) "patterns=$($labels.Count), previewHidden=$hidden"
 } catch { Add-Result 'document-financial-redaction' $false $_.Exception.Message }
 

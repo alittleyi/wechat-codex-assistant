@@ -8,6 +8,11 @@ param(
     [string]$Worker,
     [ValidatePattern('^[a-f0-9]{64}$')][string]$ClaimToken,
     [ValidatePattern('^[a-z0-9][a-z0-9._-]{0,79}$')][string]$RerunKey,
+    [ValidateSet('ready','busy','write-lock','network-failure','resume-failure','unknown')]
+    [string]$CanonicalRouteState='unknown',
+    [ValidateSet('canonical-chat','wechat-coordinator','temporary-chat','unknown')]
+    [string]$RuntimeContext='unknown',
+    [string]$ResolvedSessionRef,
     [string]$ResultSummary,
     [ValidateRange(30,3600)][int]$LeaseSeconds=300,
     [ValidateRange(1,30000)][int]$LockTimeoutMs=5000,
@@ -51,8 +56,11 @@ function Assert-StoreSemantics([object]$Store){
     foreach($item in @($Store.dispatches)){
         if($item.dispatchId-notmatch'^d-[a-f0-9]{16}$'-or$ids.ContainsKey($item.dispatchId)){throw 'invalid-dispatch-id'};$ids[$item.dispatchId]=$true
         if($item.taskKey-notmatch'^[a-z0-9][a-z0-9-]{1,62}$'-or$item.state-notin@('pending','claimed','completed','failed')){throw 'invalid-dispatch-state'}
-        if($item.packetHash-notmatch'^[a-f0-9]{64}$'-or$null-eq$item.packet-or$item.packet.protocol-ne'whole-intent-first-v1'){throw 'invalid-dispatch-packet'}
+        if($item.packetHash-notmatch'^[a-f0-9]{64}$'-or$null-eq$item.packet-or$item.packet.protocol-notin@('whole-intent-first-v1','whole-intent-first-v2')){throw 'invalid-dispatch-packet'}
         if($item.packet.taskKey-ne$item.taskKey){throw 'invalid-dispatch-packet-task'}
+        if($item.packet.protocol-eq'whole-intent-first-v2'){
+            if($item.packet.routingPolicy.mode-ne'canonical-only'-or$item.packet.routingPolicy.canonicalBindingHash-notmatch'^[a-f0-9]{64}$'-or[bool]$item.packet.routingPolicy.allowVisibleChatCreation-or[bool]$item.packet.routingPolicy.allowCoordinatorExecution-or$item.packet.routingPolicy.failureDisposition-ne'wait-and-report'){throw 'invalid-dispatch-routing-policy'}
+        }
         $actualPacketHash=Hash-Text ($item.packet|ConvertTo-Json -Depth 12 -Compress)
         if($actualPacketHash-ne$item.packetHash){throw 'invalid-dispatch-packet-hash'}
         if(-not(Test-IsoTime $item.createdAt)-or-not(Test-IsoTime $item.updatedAt)-or[datetimeoffset]::Parse($item.updatedAt)-lt[datetimeoffset]::Parse($item.createdAt)){throw 'invalid-dispatch-time'}
@@ -79,6 +87,17 @@ function Save-Store([object]$Store){
     }finally{if(Test-Path -LiteralPath $temp){Remove-Item -LiteralPath $temp -Force}}
 }
 function Hash-Text([string]$Text){$hasher=[Security.Cryptography.SHA256]::Create();try{return ([BitConverter]::ToString($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($Text)))-replace'-','').ToLowerInvariant()}finally{$hasher.Dispose()}}
+function Test-RouteAdmission([object]$Packet){
+    $reason=$null
+    if($Packet.protocol-ne'whole-intent-first-v2'-or$null-eq$Packet.routingPolicy){$reason='legacy-or-missing-routing-policy'}
+    elseif($CanonicalRouteState-ne'ready'){$reason=('canonical-route-'+$CanonicalRouteState)}
+    elseif($RuntimeContext-ne'canonical-chat'){$reason='execution-context-is-not-canonical-chat'}
+    elseif([string]::IsNullOrWhiteSpace($ResolvedSessionRef)-or(Hash-Text ($ResolvedSessionRef.Trim()))-ne[string]$Packet.routingPolicy.canonicalBindingHash){$reason='canonical-session-mismatch'}
+    if($reason){
+        return [ordered]@{status='blocked';taskKey=$Packet.taskKey;state='blocked';reason=$reason;retryable=$true;allowCreateVisibleChat=$false;allowCurrentSessionExecution=$false;allowDownstream=$false}
+    }
+    return [ordered]@{status='ok';allowed=$true}
+}
 function Safe-View([object]$Item,[bool]$IncludePacket=$false,[bool]$Reused=$false,[string]$PlainClaimToken=$null){
     $view=[ordered]@{status='ok';dispatchId=$Item.dispatchId;taskKey=$Item.taskKey;state=$Item.state;worker=$Item.worker;attempt=[int]$Item.attempt;leaseExpiresAt=$Item.leaseExpiresAt;createdAt=$Item.createdAt;updatedAt=$Item.updatedAt;resultSummary=$Item.resultSummary;reused=$Reused}
     if($IncludePacket){$view.packet=$Item.packet}
@@ -119,6 +138,8 @@ try{
         if($TaskKey-notmatch '^[a-z0-9][a-z0-9-]{1,62}$'){throw 'Invalid TaskKey.'}
         $handoffRaw=& (Join-Path $PSScriptRoot 'task-chat-registry.ps1') -Action handoff -TaskKey $TaskKey -RegistryPath $RegistryPath
         $handoff=$handoffRaw|ConvertFrom-Json
+        $route=Test-RouteAdmission $handoff.packet
+        if(-not$route.allowed){$route|ConvertTo-Json -Depth 5;return}
         $packetHash=Hash-Text ($handoff.packet|ConvertTo-Json -Depth 12 -Compress);$rerunHash=if($RerunKey){Hash-Text $RerunKey}else{$null}
         $existing=@($store.dispatches|Where-Object{$_.taskKey-eq$TaskKey-and$_.packetHash-eq$packetHash-and$_.rerunKeyHash-eq$rerunHash}|Sort-Object createdAt -Descending|Select-Object -First 1)
         if($existing.Count-eq1){Safe-View $existing[0] $false $true|ConvertTo-Json -Depth 5;return}
@@ -128,6 +149,8 @@ try{
     }
     $item=Find-Dispatch $store;$now=Get-Date
     if($Action-eq'claim'){
+        $route=Test-RouteAdmission $item.packet
+        if(-not$route.allowed){$route|ConvertTo-Json -Depth 5;return}
         $workerClean=Clean $Worker 120;if(-not$workerClean){throw 'Worker is required.'}
         $expired=$item.state-eq'claimed'-and$null-ne$item.leaseExpiresAt-and$now.ToUniversalTime()-gt[datetime]::Parse($item.leaseExpiresAt).ToUniversalTime()
         if($item.state-ne'pending' -and -not $expired){throw 'Dispatch is not claimable.'}

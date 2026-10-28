@@ -43,6 +43,12 @@ function Read-Registry(){
 }
 function Require-Key(){if([string]::IsNullOrWhiteSpace($TaskKey)-or$TaskKey-notmatch '^[a-z0-9][a-z0-9-]{1,62}$'){throw 'TaskKey must be a 2-63 character lowercase slug.'}}
 function Find-Task([object]$Registry){Require-Key;$matches=@($Registry.tasks|Where-Object{$_.taskKey-eq$TaskKey});if($matches.Count-ne1){throw 'Task was not found or is ambiguous.'};return $matches[0]}
+function Hash-Text([string]$Value){
+    if([string]::IsNullOrWhiteSpace($Value)){return $null}
+    $hasher=[Security.Cryptography.SHA256]::Create()
+    try{return ([BitConverter]::ToString($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($Value.Trim())))-replace'-','').ToLowerInvariant()}
+    finally{$hasher.Dispose()}
+}
 function Text([string]$Value,[int]$Max){if([string]::IsNullOrWhiteSpace($Value)){return $null};$clean=($Value-replace '\s+',' ').Trim();if($clean.Length-gt$Max){throw "Text exceeds $Max characters."};return $clean}
 function Texts([string[]]$Values,[int]$MaxItems=20,[int]$MaxLength=500){$items=@($Values|Where-Object{-not[string]::IsNullOrWhiteSpace($_)}|ForEach-Object{Text $_ $MaxLength});if($items.Count-gt$MaxItems){throw "Too many list items; maximum is $MaxItems."};return $items}
 function Safe-Status([object]$Task){
@@ -55,6 +61,7 @@ if($Action-eq'register'){
     Require-Key
     if(@($registry.tasks|Where-Object{$_.taskKey-eq$TaskKey}).Count-ne0){throw 'TaskKey already exists.'}
     if([string]::IsNullOrWhiteSpace($Title)-or[string]::IsNullOrWhiteSpace($Goal)-or[string]::IsNullOrWhiteSpace($IntentSummary)){throw 'Title, Goal and IntentSummary are required.'}
+    if([string]::IsNullOrWhiteSpace($CanonicalChatTitle)-xor[string]::IsNullOrWhiteSpace($CanonicalSessionRef)){throw 'CanonicalChatTitle and CanonicalSessionRef must be supplied together.'}
     $now=(Get-Date).ToString('o')
     $task=[ordered]@{taskKey=$TaskKey;title=(Text $Title 120);goal=(Text $Goal 2000);intentSummary=(Text $IntentSummary 4000);qualityBars=(Texts $QualityBars);rejectedDirections=(Texts $RejectedDirections);acceptanceCriteria=(Texts $AcceptanceCriteria);canonicalChatTitle=(Text $CanonicalChatTitle 160);canonicalSessionRef=(Text $CanonicalSessionRef 500);state=if($State){$State}else{'active'};currentStep=(Text $CurrentStep 500);nextAction=(Text $NextAction 500);createdAt=$now;updatedAt=$now;changes=@()}
     $registry.tasks=@($registry.tasks)+@($task);Save-Registry $registry
@@ -66,6 +73,7 @@ $task=Find-Task $registry
 if($Action-eq'status'){Safe-Status $task|ConvertTo-Json -Depth 6;return}
 if($Action-eq'bind'){
     if([string]::IsNullOrWhiteSpace($CanonicalChatTitle)-or[string]::IsNullOrWhiteSpace($CanonicalSessionRef)){throw 'CanonicalChatTitle and CanonicalSessionRef are required.'}
+    if(-not[string]::IsNullOrWhiteSpace([string]$task.canonicalSessionRef)-and[string]$task.canonicalSessionRef-ne$CanonicalSessionRef){throw 'Canonical chat is already bound; refusing to replace it with another session.'}
     $task.canonicalChatTitle=Text $CanonicalChatTitle 160;$task.canonicalSessionRef=Text $CanonicalSessionRef 500
 }elseif($Action-eq'update'){
     if(-not$ChangeSummary){throw 'ChangeSummary is required so later handoffs preserve why the task changed.'}
@@ -77,7 +85,7 @@ if($Action-eq'bind'){
     if($CurrentStep){$task.currentStep=Text $CurrentStep 500};if($NextAction){$task.nextAction=Text $NextAction 500}
 }elseif($Action-eq'archive'){$task.state='archived';$task.nextAction=$null
 }elseif($Action-eq'handoff'){
-    $packet=[ordered]@{protocol='whole-intent-first-v1';taskKey=$task.taskKey;canonicalChatTitle=$task.canonicalChatTitle;instruction='Preserve the complete intent before applying the latest change or bounded subtask. A local request must not replace established quality bars.';goal=$task.goal;intentSummary=$task.intentSummary;qualityBars=@($task.qualityBars);rejectedDirections=@($task.rejectedDirections);acceptanceCriteria=@($task.acceptanceCriteria);latestChange=if(@($task.changes).Count){$task.changes[-1].summary}else{$null};currentStep=$task.currentStep;nextAction=$task.nextAction;requestedSubtask=(Text $Subtask 2000);returnContract=@('Report completed work','List evidence or artifacts','Report unfinished work and risks','Merge results into the canonical chat; do not create a visible chat')}
+    $packet=[ordered]@{protocol='whole-intent-first-v2';taskKey=$task.taskKey;canonicalChatTitle=$task.canonicalChatTitle;routingPolicy=[ordered]@{mode='canonical-only';canonicalBindingHash=(Hash-Text ([string]$task.canonicalSessionRef));allowVisibleChatCreation=$false;allowCoordinatorExecution=$false;failureDisposition='wait-and-report'};instruction='Preserve the complete intent before applying the latest change or bounded subtask. A local request must not replace established quality bars.';goal=$task.goal;intentSummary=$task.intentSummary;qualityBars=@($task.qualityBars);rejectedDirections=@($task.rejectedDirections);acceptanceCriteria=@($task.acceptanceCriteria);latestChange=if(@($task.changes).Count){$task.changes[-1].summary}else{$null};currentStep=$task.currentStep;nextAction=$task.nextAction;requestedSubtask=(Text $Subtask 2000);returnContract=@('Report completed work','List evidence or artifacts','Report unfinished work and risks','Merge results into the canonical chat; do not create a visible chat')}
     [ordered]@{status='ok';packet=$packet}|ConvertTo-Json -Depth 10;return
 }
 $task.updatedAt=(Get-Date).ToString('o');Save-Registry $registry
